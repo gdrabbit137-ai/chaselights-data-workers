@@ -1,0 +1,193 @@
+name: CWA Low Cloud Calibration
+
+on:
+  schedule:
+    # Sample one daytime and one nighttime CWA/Himawari pair each day.
+    # These times follow the existing WeatherGrid refresh cadence and occur
+    # after f006 has become an observation-time holdout.
+    - cron: '30 8,20 * * *'
+  push:
+    branches: [main]
+    paths:
+      - "cwa_cloud_calibration.py"
+      - "cwa_cloud_calibration_history.py"
+      - "test_cwa_cloud_calibration.py"
+      - "test_cwa_cloud_calibration_history.py"
+      - "B175_CWA_LOW_CLOUD_CALIBRATION.md"
+      - ".github/workflows/cwa_low_cloud_calibration.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cwa_cloud_calibration.py"
+      - "test_cwa_cloud_calibration.py"
+      - "cwa_cloud_calibration_history.py"
+      - "test_cwa_cloud_calibration_history.py"
+      - "cwa_weathergrid_derived.py"
+      - "himawari9_cloud_poc.py"
+      - "himawari9_weathergrid_browser_bundle.py"
+      - "test_himawari9_cloud_poc.py"
+      - "test_himawari9_weathergrid_browser_bundle.py"
+      - "B175_CWA_LOW_CLOUD_CALIBRATION.md"
+      - ".github/workflows/cwa_low_cloud_calibration.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Mark job start
+        # Every producer writes into weathergrid/ during this job; the R2
+        # publisher uploads exactly those files (checkout mtimes are useless as
+        # a discriminator — a fresh clone touches everything).
+        run: touch /tmp/job_start
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install calibration dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            numpy scipy pyproj s3fs h5py
+
+      - name: Run calibration unit tests
+        run: |
+          python -m unittest -v \
+            test_cwa_cloud_calibration.py \
+            test_cwa_cloud_calibration_history.py \
+            test_himawari9_cloud_poc.py \
+            test_himawari9_weathergrid_browser_bundle.py
+
+      - name: Select two completed CWA valid times
+        run: |
+          python - <<'PY' > /tmp/cwa-calibration-slots.txt
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          bundle = json.loads(
+              Path("weathergrid/cwa_wrf3_tw_weather_browser.json").read_text()
+          )
+          now = datetime.now(timezone.utc)
+          completed = []
+          for frame in bundle["frames"]:
+              valid = datetime.fromisoformat(
+                  frame["valid_time_utc"].replace("Z", "+00:00")
+              ).astimezone(timezone.utc)
+              if valid <= now:
+                  completed.append(valid)
+          completed = sorted(set(completed))
+          assert len(completed) >= 2, completed
+          for value in completed[-2:]:
+              assert value.minute % 10 == 0 and value.second == 0, value
+              print(value.isoformat().replace("+00:00", "Z"))
+          PY
+          cat /tmp/cwa-calibration-slots.txt
+
+      - name: Fetch exact-slot Himawari observations
+        run: |
+          index=0
+          while IFS= read -r slot; do
+            out="/tmp/himawari-cal-${index}"
+            # NOAA NODD publishes AHI-L2-FLDK-Clouds products roughly 10-20
+            # minutes after the observation slot, so a just-completed CWA
+            # slot is routinely raced. Retry the exact slot with backoff and
+            # fail closed only once the retry budget is exhausted.
+            attempt=1
+            max_attempts=6
+            while true; do
+              if python himawari9_weathergrid_browser_bundle.py \
+                --slot-utc "$slot" \
+                --output-dir "$out"
+              then
+                break
+              fi
+              if [[ "$attempt" -ge "$max_attempts" ]]; then
+                echo "Himawari cloud products for slot $slot unavailable after $max_attempts attempts."
+                exit 1
+              fi
+              echo "Attempt $attempt for slot $slot failed; retrying in 180s."
+              attempt=$((attempt + 1))
+              sleep 180
+            done
+            index=$((index + 1))
+          done < /tmp/cwa-calibration-slots.txt
+          test "$index" -ge 2
+
+      - name: Calibrate CWA low-cloud proxy
+        run: |
+          python cwa_cloud_calibration.py \
+            --cwa weathergrid/cwa_wrf3_tw_weather_browser.json \
+            --himawari /tmp/himawari-cal-0/himawari9_tw_cloud_browser.json \
+            --himawari /tmp/himawari-cal-1/himawari9_tw_cloud_browser.json \
+            --output /tmp/cwa-low-cloud-calibration.json \
+            | tee /tmp/cwa-low-cloud-calibration.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/cwa-low-cloud-calibration.json").read_text())
+          assert len(report["snapshots"]) >= 2, report["snapshots"]
+          assert report["validation"] is not None
+          assert report["selected_candidate"]["feature"] in {
+              "rh_min",
+              "rh_avg",
+              "rh_avg_spread25",
+              "rh_avg_spread50",
+              "rh_avg_spread75",
+          }
+          for snapshot in report["snapshots"]:
+              assert snapshot["time_delta_seconds"] <= 60
+              assert snapshot["label_counts"]["usable"] >= 1000
+          print(json.dumps({
+              "selected_candidate": report["selected_candidate"],
+              "validation": report["validation"],
+              "validation_candidates": report["validation_candidates"],
+              "promotion": report["promotion"],
+          }, indent=2))
+          PY
+
+      - name: Upload calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwa-low-cloud-calibration
+          path: |
+            /tmp/cwa-low-cloud-calibration.json
+            /tmp/cwa-low-cloud-calibration.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      - name: Persist scheduled calibration history
+        if: github.event_name != 'pull_request'
+        run: |
+          # Rebase onto the tip of main before generating history so the
+          # auto-commit below is based on the latest scheduled auto-updates
+          # (weathergrid/calibration files) and the final pull --rebase
+          # cannot hit a stale-base conflict.
+          # actions/checkout fetches with depth=1, which leaves rebase
+          # without a merge-base (add/add conflicts). Unshallow first so
+          # the rebase and the final pull --rebase can resolve properly.
+          git fetch --unshallow origin main 2>/dev/null || git fetch origin main
+          git rebase origin/main
+
+          python cwa_cloud_calibration_history.py \
+            --report /tmp/cwa-low-cloud-calibration.json \
+            --history weathergrid/calibration/cwa_low_cloud_history.json \
+            --latest weathergrid/calibration/cwa_low_cloud_latest.json
+          python -m pip install --quiet 'boto3>=1.34'
+          find weathergrid -type f -newer /tmp/job_start -print > /tmp/changed.txt || true
+          echo "changed files: $(wc -l < /tmp/changed.txt)"
+          if [ -s /tmp/changed.txt ]; then
+            python ops/pages/r2_sync.py --apply --only weathergrid --from-disk \
+              --files-from /tmp/changed.txt --workers 12
+          else
+            echo "nothing changed; R2 untouched"
+          fi

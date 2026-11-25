@@ -1,0 +1,223 @@
+name: B167 CAMS AOD + PM2.5 WeatherGrid
+
+on:
+  pull_request:
+    paths:
+      - "cams_aod_weathergrid.py"
+      - "test_cams_aod_weathergrid.py"
+      - "assets/weather-map.js"
+      - "weather-map.html"
+      - "PHOTOGRAPHY_ENVIRONMENT_LAYERS_ROADMAP.md"
+      - "B166_CAMS_AOD_WEATHERGRID.md"
+      - ".github/workflows/b166_cams_aod_weathergrid.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "cams_aod_weathergrid.py"
+      - "assets/weather-map.js"
+      - "weather-map.html"
+      - ".github/workflows/b166_cams_aod_weathergrid.yml"
+  schedule:
+    - cron: "40 5,17 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: b166-cams-aod-weathergrid
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark job start
+        # Every producer writes into weathergrid/ during this job; the R2
+        # publisher uploads exactly those files (checkout mtimes are useless as
+        # a discriminator — a fresh clone touches everything).
+        run: touch /tmp/job_start
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install requests
+      - run: python -m unittest -v test_cams_aod_weathergrid.py test_weathergrid_ui_polish.py
+
+  live-publish-tw:
+    if: github.event_name != 'pull_request'
+    needs: contract-tests
+    runs-on: ubuntu-latest
+    # CL-CI-38 root cause of the recurring ingest red: Open-Meteo counts
+    # location-calls (a 60-location batch = 60 calls) against the free-tier
+    # quota of the runner's IP — ~5k/hour and ~10k/day. The old 8s batch
+    # delay pulled ~450 calls/min, blew through the hourly ~5k after ~11
+    # minutes, and the whole tw sweep died on a 429. A 48s batch delay
+    # sustains ~75 calls/min (~4.5k/hour), just under the hourly ceiling.
+    # CL-CI-09: the CL-CI-08 ReadTimeout retry (up to 8 attempts x 300s read
+    # timeout + backoff per batch) trades a fast crash for a long but
+    # legitimate refresh; the window gives the fetch retry chain room to
+    # complete instead of being silently cancelled, leaving stale data.
+    # ~150 batches x 48s is ~2h; 300 minutes covers retry bursts on top.
+    timeout-minutes: 300
+    steps:
+      - name: Mark job start
+        # Every producer writes into weathergrid/ during this job; the R2
+        # publisher uploads exactly those files (checkout mtimes are useless as
+        # a discriminator — a fresh clone touches everything).
+        run: touch /tmp/job_start
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install requests
+      - name: Fetch CAMS Global AOD (tw) via Open-Meteo
+        run: |
+          python cams_aod_weathergrid.py \
+            --forecast-hours 120 \
+            --batch-delay-s 48 \
+            --retries 8 \
+            --output-dir cams_aod_output
+      - name: Validate live bundle
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("cams_aod_output/cams_global_tw_aod_browser.json")
+          q=Path("cams_aod_output/cams_global_tw_aod_qc.json")
+          data=json.loads(p.read_text())
+          qc=json.loads(q.read_text())
+          assert data["model"]=="CAMS_GLOBAL"
+          assert data["frames"]
+          assert "aerosol_optical_depth_550nm" in data["fields"]
+          assert "pm2_5_ug_m3" in data["fields"]
+          assert data["fields"]["pm2_5_ug_m3"]["unit"]=="µg/m³"
+          assert data["provenance"]["native_resolution_km"]==45.0
+          assert data["provenance"]["native_time_interval_hours"]==3
+          assert qc["frame_count"]==len(data["frames"])
+          for field in ("aerosol_optical_depth_550nm","pm2_5_ug_m3"):
+              all_missing=[x for x in qc["flags"] if x["flag"]=="all_missing" and x["field"]==field]
+              assert len(all_missing) < qc["frame_count"], f"all CAMS {field} frames are missing"
+          print(json.dumps({
+              "frames":len(data["frames"]),
+              "grid":[data["grid"]["rows"],data["grid"]["cols"]],
+              "provider_cells":qc["returned_provider_cell_count"],
+          },indent=2))
+          PY
+      - name: Publish AOD browser bundle (tw)
+        run: |
+          mkdir -p weathergrid
+          cp cams_aod_output/cams_global_tw_aod_browser.json weathergrid/cams_global_tw_aod_browser.json
+          cp cams_aod_output/cams_global_tw_aod_qc.json weathergrid/cams_global_tw_aod_qc.json
+          python -m pip install --quiet 'boto3>=1.34'
+          find weathergrid -type f -newer /tmp/job_start -print > /tmp/changed.txt || true
+          echo "changed files: $(wc -l < /tmp/changed.txt)"
+          if [ -s /tmp/changed.txt ]; then
+            python ops/pages/r2_sync.py --apply --only weathergrid --from-disk \
+              --files-from /tmp/changed.txt --workers 12
+          else
+            echo "nothing changed; R2 untouched"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cams-aod-weathergrid-tw
+          path: cams_aod_output/
+          retention-days: 7
+
+  live-publish-us:
+    if: github.event_name != 'pull_request'
+    needs: contract-tests
+    runs-on: ubuntu-latest
+    # CL-CI-38: the us sweep runs in its OWN job on its OWN runner, so it
+    # gets a fresh per-IP daily quota (~10k location-calls). Previously the
+    # tw (~9k) and us (~8.7k) sweeps shared one runner IP: together they
+    # exceeded the free-tier daily quota and the us fetch was guaranteed to
+    # 429 — and on quota-heavy days the failure surfaced mid-tw too. Rate
+    # limiting matches live-publish-tw (48s delay ≈ 75 calls/min under the
+    # ~5k/hour ceiling); ~145 batches x 48s is ~2h.
+    timeout-minutes: 300
+    steps:
+      - name: Mark job start
+        # Every producer writes into weathergrid/ during this job; the R2
+        # publisher uploads exactly those files (checkout mtimes are useless as
+        # a discriminator — a fresh clone touches everything).
+        run: touch /tmp/job_start
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install requests
+      - name: Fetch CAMS Global AOD (us) via Open-Meteo
+        run: |
+          python cams_aod_weathergrid.py \
+            --region us \
+            --forecast-hours 120 \
+            --batch-delay-s 48 \
+            --retries 8 \
+            --output-dir cams_aod_output_us
+      - name: Validate live us bundle
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("cams_aod_output_us/cams_global_us_aod_browser.json")
+          q=Path("cams_aod_output_us/cams_global_us_aod_qc.json")
+          data=json.loads(p.read_text())
+          qc=json.loads(q.read_text())
+          assert data["model"]=="CAMS_GLOBAL"
+          assert data["frames"]
+          assert "aerosol_optical_depth_550nm" in data["fields"]
+          assert "pm2_5_ug_m3" in data["fields"]
+          assert data["fields"]["pm2_5_ug_m3"]["unit"]=="µg/m³"
+          assert data["provenance"]["native_resolution_km"]==45.0
+          assert data["provenance"]["native_time_interval_hours"]==3
+          # CL-DATA-07: the us bundle window must fully cover the us region
+          # bbox (125–70.5°W / 25–49.5°N) or the dropdown must not offer it.
+          assert data["bbox"]["leftlon"] <= -125.0
+          assert data["bbox"]["rightlon"] >= -70.5
+          assert data["bbox"]["bottomlat"] <= 25.0
+          assert data["bbox"]["toplat"] >= 49.5
+          assert qc["frame_count"]==len(data["frames"])
+          for field in ("aerosol_optical_depth_550nm","pm2_5_ug_m3"):
+              all_missing=[x for x in qc["flags"] if x["flag"]=="all_missing" and x["field"]==field]
+              assert len(all_missing) < qc["frame_count"], f"all CAMS us {field} frames are missing"
+          print(json.dumps({
+              "region":"us",
+              "frames":len(data["frames"]),
+              "grid":[data["grid"]["rows"],data["grid"]["cols"]],
+              "provider_cells":qc["returned_provider_cell_count"],
+          },indent=2))
+          PY
+      - name: Publish AOD browser bundle (us)
+        run: |
+          mkdir -p weathergrid
+          cp cams_aod_output_us/cams_global_us_aod_browser.json weathergrid/cams_global_us_aod_browser.json
+          cp cams_aod_output_us/cams_global_us_aod_qc.json weathergrid/cams_global_us_aod_qc.json
+          # CL-DATA-07: keep the us coverage manifest (the us region layer
+          # list) in sync with the actually-published us bundles.
+          python build_weathergrid_coverage_browser.py \
+            --region us \
+            --output weathergrid/weathergrid_coverage_us_browser.json
+          python -m pip install --quiet 'boto3>=1.34'
+          find weathergrid -type f -newer /tmp/job_start -print > /tmp/changed.txt || true
+          echo "changed files: $(wc -l < /tmp/changed.txt)"
+          if [ -s /tmp/changed.txt ]; then
+            python ops/pages/r2_sync.py --apply --only weathergrid --from-disk \
+              --files-from /tmp/changed.txt --workers 12
+          else
+            echo "nothing changed; R2 untouched"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cams-aod-weathergrid-us
+          path: cams_aod_output_us/
+          retention-days: 7

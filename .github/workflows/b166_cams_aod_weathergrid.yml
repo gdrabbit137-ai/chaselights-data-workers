@@ -43,7 +43,9 @@ jobs:
         with:
           python-version: "3.10"
       - run: python -m pip install requests
-      - run: python -m unittest -v test_cams_aod_weathergrid.py test_weathergrid_ui_polish.py
+      # test_weathergrid_ui_polish.py stays in the private app repo: it pins
+      # weather-map.html + assets/*.js, which this repo does not carry.
+      - run: python -m unittest -v test_cams_aod_weathergrid.py
 
   live-publish-tw:
     if: github.event_name != 'pull_request'

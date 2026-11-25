@@ -32,6 +32,11 @@ permissions:
 jobs:
   contract-tests:
     runs-on: ubuntu-latest
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: chaselights-data
+      R2_ENDPOINT: https://218303e56b40f3bc72f70bcc975fda64.r2.cloudflarestorage.com
     steps:
       - name: Mark job start
         # Every producer writes into weathergrid/ during this job; the R2
@@ -69,6 +74,11 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: contract-tests
     runs-on: ubuntu-latest
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: chaselights-data
+      R2_ENDPOINT: https://218303e56b40f3bc72f70bcc975fda64.r2.cloudflarestorage.com
     # CL-CI-38 root cause of the recurring ingest red: Open-Meteo counts
     # location-calls (a 60-location batch = 60 calls) against the free-tier
     # quota of the runner's IP — ~5k/hour and ~10k/day. The old 8s batch
@@ -171,6 +181,11 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: contract-tests
     runs-on: ubuntu-latest
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: chaselights-data
+      R2_ENDPOINT: https://218303e56b40f3bc72f70bcc975fda64.r2.cloudflarestorage.com
     # CL-CI-38: the us sweep runs in its OWN job on its OWN runner, so it
     # gets a fresh per-IP daily quota (~10k location-calls). Previously the
     # tw (~9k) and us (~8.7k) sweeps shared one runner IP: together they

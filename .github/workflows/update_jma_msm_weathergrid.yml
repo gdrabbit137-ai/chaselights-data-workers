@@ -1,4 +1,5 @@
 name: Update JMA MSM WeatherGrid
+# probe-2: verify r2_sync --files-from --from-disk actually uploads
 
 on:
   schedule:

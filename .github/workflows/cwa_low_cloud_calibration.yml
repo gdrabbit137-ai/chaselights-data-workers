@@ -47,6 +47,24 @@ jobs:
       - name: Checkout candidate
         uses: actions/checkout@v4
 
+
+      # CL-PAGES-08: this repo no longer carries weathergrid/ in git — the bucket
+      # is the source of truth. Producers that rebuild weathergrid/index.json
+      # hash the files on disk, and the calibration job reads the previous CWA
+      # bundle, so pull the tree down before anything writes to it. R2 egress is
+      # free; the cost is ~1 min per run.
+      - name: Hydrate weathergrid from R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: chaselights-data
+          R2_ENDPOINT: https://218303e56b40f3bc72f70bcc975fda64.r2.cloudflarestorage.com
+        run: |
+          python -m pip install --quiet 'boto3>=1.34'
+          python ops/pages/r2_pull.py --prefix weathergrid/ --dest . --workers 32
+          # The hydration writes newer than /tmp/job_start; backdate it so the
+          # publish step uploads only what this run actually produced.
+          find weathergrid -type f -exec touch -d '2000-01-01T00:00:00Z' {} +
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -168,15 +186,6 @@ jobs:
       - name: Persist scheduled calibration history
         if: github.event_name != 'pull_request'
         run: |
-          # Rebase onto the tip of main before generating history so the
-          # auto-commit below is based on the latest scheduled auto-updates
-          # (weathergrid/calibration files) and the final pull --rebase
-          # cannot hit a stale-base conflict.
-          # actions/checkout fetches with depth=1, which leaves rebase
-          # without a merge-base (add/add conflicts). Unshallow first so
-          # the rebase and the final pull --rebase can resolve properly.
-          git fetch --unshallow origin main 2>/dev/null || git fetch origin main
-          git rebase origin/main
 
           python cwa_cloud_calibration_history.py \
             --report /tmp/cwa-low-cloud-calibration.json \

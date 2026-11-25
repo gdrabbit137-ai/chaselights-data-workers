@@ -28,6 +28,7 @@ import argparse
 import mimetypes
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -101,9 +102,14 @@ def iter_files(only: tuple[str, ...] = PREFIXES, from_disk: bool = False):
             yield rel, path
 
 
-def plan(only: tuple[str, ...], from_disk: bool = False):
+def plan(only: tuple[str, ...], from_disk: bool = False, since_minutes: float | None = None):
     rows = []
+    cutoff = None
+    if since_minutes:
+        cutoff = time.time() - since_minutes * 60
     for rel, path in iter_files(only, from_disk=from_disk):
+        if cutoff is not None and os.path.getmtime(path) < cutoff:
+            continue
         rows.append({
             "key": rel,
             "path": path,
@@ -194,6 +200,8 @@ def main() -> int:
                     help="newline-separated repo-relative paths to sync (default: all tracked)")
     ap.add_argument("--from-disk", action="store_true",
                     help="scan the working tree instead of the git index (for deliberately uncommitted trees)")
+    ap.add_argument("--since-minutes", type=float, default=None,
+                    help="with --from-disk: only files modified within this window (producers touch a few files per run)")
     ap.add_argument("--bucket", default=os.environ.get("R2_BUCKET", DEFAULT_BUCKET))
     ap.add_argument("--endpoint", default=os.environ.get(
         "R2_ENDPOINT", f"https://{DEFAULT_ACCOUNT}.r2.cloudflarestorage.com"))
@@ -214,12 +222,12 @@ def main() -> int:
                 + ", ".join(outside[:3])
             )
         wanted = [w for w in wanted if w.startswith(only)]
-        present = {rel: path for rel, path in iter_files(only)}
+        present = {rel: path for rel, path in iter_files(only, from_disk=args.from_disk)}
         rows = [{"key": w, "path": present[w], "size": os.path.getsize(present[w]),
                  "content_type": content_type(w), "cache_control": cache_control(w)}
                 for w in wanted if w in present]
     else:
-        rows = plan(only, from_disk=args.from_disk)
+        rows = plan(only, from_disk=args.from_disk, since_minutes=args.since_minutes)
     total_bytes = sum(r["size"] for r in rows)
 
     by_cache: dict[str, int] = {}

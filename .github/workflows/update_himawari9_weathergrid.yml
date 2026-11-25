@@ -1,4 +1,5 @@
 name: Update Himawari-9 WeatherGrid
+# CL-PAGES-08 verify: R2 secrets are in place; this push is the end-to-end probe.
 
 on:
   schedule:
